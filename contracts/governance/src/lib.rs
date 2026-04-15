@@ -169,6 +169,7 @@ impl VotingSystem {
     ///
     /// The function will panic if no voting powers are set for the active round.
     pub fn tally_submission(env: &Env, submission_id: String) -> Result<I256, VotingSystemError> {
+        require_admin(env);
         let submission_votes = Self::get_votes_for_submission(env, submission_id.clone())?;
         let mut submission_voting_power_plus = I256::from_i32(env, 0);
         let mut submission_voting_power_minus = I256::from_i32(env, 0);
@@ -277,25 +278,6 @@ impl Governance for VotingSystem {
             .remove(u32::try_from(index).unwrap());
 
         write_neural_governance(&env, neural_governance);
-
-        Ok(())
-    }
-
-    fn update_layer(
-        env: Env,
-        layer_id: String,
-        raw_neurons: Vec<(String, I256)>,
-        layer_aggregator: LayerAggregator,
-    ) -> Result<(), VotingSystemError> {
-        require_admin(&env);
-
-        let layer = read_layer(&env, &layer_id)?;
-
-        for neuron_id in layer.neurons {
-            remove_neuron(&env, &layer_id, &neuron_id);
-        }
-
-        create_or_update_layer(env, layer_id, raw_neurons, layer_aggregator);
 
         Ok(())
     }
