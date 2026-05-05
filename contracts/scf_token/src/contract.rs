@@ -10,7 +10,7 @@ use crate::storage::{
     read_all_addresses, read_governance_contract_address, read_total_supply, update_all_addresses,
     write_governance_contract_address, write_total_supply,
 };
-use crate::types::{ContractError, DataKey, VotesError};
+use crate::types::{ContractError, VotesError};
 use crate::votes::Votes;
 
 pub const DECIMALS: u32 = 9;
@@ -29,13 +29,7 @@ pub struct SCFToken;
 #[contractimpl]
 #[allow(clippy::needless_pass_by_value)]
 impl SCFToken {
-    pub fn initialize(env: Env, admin: Address, governance_address: Address) {
-        assert_with_error!(
-            env,
-            !env.storage().instance().has(&DataKey::Admin),
-            ContractError::ContractAlreadyInitialized
-        );
-
+    pub fn __constructor(env: Env, admin: Address, governance_address: Address) {
         write_admin(&env, &admin);
         write_governance_contract_address(&env, &governance_address);
     }
@@ -64,7 +58,7 @@ impl SCFToken {
             ContractError::VotingPowerAlreadyUpdatedForUser
         );
 
-        let voting_power = voting_power_for_user(&env, &governance_client, &address)?;
+        let voting_power = voting_power_for_user(&env, &governance_client, &address);
 
         let voting_power_whole = scf_score_to_balance(&env, &voting_power);
         let voting_power_i128: i128 = voting_power_whole
@@ -122,13 +116,13 @@ fn voting_power_for_user(
     env: &Env,
     governance_client: &governance::Client,
     address: &Address,
-) -> Result<I256, ContractError> {
+) -> I256 {
     let voting_power: I256 = governance_client.get_voting_power_for_user(&address.to_string());
-    Ok(if voting_power >= I256::from_i32(env, 0) {
+    if voting_power >= I256::from_i32(env, 0) {
         voting_power
     } else {
         I256::from_i32(env, 0)
-    })
+    }
 }
 
 fn scf_score_to_balance(env: &Env, value: &I256) -> I256 {

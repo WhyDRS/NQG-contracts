@@ -10,7 +10,7 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, BytesN, Env, Map, String, Vec, I256,
 };
 
-use admin::{is_set_admin, require_admin};
+use admin::require_admin;
 
 use crate::admin::set_admin;
 use crate::admin::traits::Admin;
@@ -72,8 +72,7 @@ pub enum DataKey {
 #[contractimpl]
 impl VotingSystem {
     /// Initialize the governance contract.
-    pub fn initialize(env: Env, admin: Address, current_round: u32) {
-        assert!(!is_set_admin(&env), "Admin already set");
+    pub fn __constructor(env: Env, admin: Address, current_round: u32) {
         set_admin(&env, &admin);
 
         let neural_governance = NGQ::new(&env);
@@ -218,9 +217,9 @@ impl VotingSystem {
                 if let Some(voting_power) = voting_powers.get(user) {
                     return Ok(voting_power);
                 }
-                return Err(VotingSystemError::NGQResultForVoterMissing);
+                Err(VotingSystemError::NGQResultForVoterMissing)
             }
-            Err(_) => return Err(VotingSystemError::UnknownError),
+            Err(_) => Err(VotingSystemError::UnknownError),
         }
     }
 }
