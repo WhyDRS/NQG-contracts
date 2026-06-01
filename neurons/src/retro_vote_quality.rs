@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 const DELEGATED_VOTE_DENOMINATOR: i32 = 2;
 const FIXED_POINT_SCALING_FACTOR: i32 = 100; // *10 to mitigate float precission loss, and *10 to allow integer division
-const ZERO_SNAP_THRESHOLD: f64 = 0.001; // float-noise floor: |output| <= this collapses to 0
 #[derive(Clone, Debug)]
 pub struct RetroVoteQualityNeuron {
     votes_per_round: HashMap<u32, HashMap<String, HashMap<String, Vote>>>, // round -> submission -> user -> vote (Yes/No/Abstain/Delegate)
@@ -66,12 +65,7 @@ impl RetroVoteQualityNeuron {
             }
         }
         let raw_bonus = total_bonus as f64 / FIXED_POINT_SCALING_FACTOR as f64;
-        // Mirror the curve around 0: run |raw| through the logistic (baseline-shifted
-        // so raw=0 maps to 0) and flip the sign for negative raw bonuses, so penalties
-        // produce symmetric negative scores instead of being clipped at the a=0 floor.
-        let magnitude = logistic(raw_bonus.abs()) - logistic(0.0);
-        let signed = if raw_bonus < 0.0 { -magnitude } else { magnitude };
-        if signed.abs() <= ZERO_SNAP_THRESHOLD { 0.0 } else { signed }
+        generalised_logistic_function(-5.0, 5.0, 1.0, 1.0, 0.4, 1.0, 0.0, raw_bonus)
     }
     fn resolve_delegated_vote(
         &self,
@@ -107,9 +101,7 @@ impl RetroVoteQualityNeuron {
         None
     }
 }
-fn logistic(raw_bonus: f64) -> f64 {
-    generalised_logistic_function(0.0, 5.0, 1.0, 4.0, 1.0, 1.0, 1.0, raw_bonus)
-}
+
 fn tranche_status_to_bonus(tranche_status: &str) -> i32 {
     match tranche_status {
         "Live on Stellar within 6 months" => 30,               // 0.3
@@ -149,12 +141,11 @@ mod tests {
 
     const FLOAT_EPS: f64 = 1e-12;
 
+    // Mirrors the production curve: the generalised logistic with these parameters
+    // reduces to 5*tanh(0.2*raw) — antisymmetric about the origin, bounded in (-5, 5),
+    // with raw=0 mapping to exactly 0.0.
     fn logistic_of(raw_bonus: f64) -> f64 {
-        // Mirrors the production formula: logistic(|raw|) - logistic(0), negated
-        // for negative raw, so raw=0 maps to 0 and penalties stay symmetric.
-        let f = |x| generalised_logistic_function(0.0, 5.0, 1.0, 4.0, 1.0, 1.0, 1.0, x);
-        let magnitude = f(raw_bonus.abs()) - f(0.0);
-        if raw_bonus < 0.0 { -magnitude } else { magnitude }
+        generalised_logistic_function(-5.0, 5.0, 1.0, 1.0, 0.4, 1.0, 0.0, raw_bonus)
     }
 
     fn assert_close(actual: f64, expected: f64) {
@@ -227,7 +218,7 @@ mod tests {
             HashMap::new(),
             &[("sub1", "rec1", LIVE_WITHIN_6)],
         );
-        let baseline = logistic_of(0.0);
+        let baseline = 0.0;
         assert_close(neuron.run_user("alice"), baseline);
         assert_close(neuron.run_user("bob"), baseline);
     }
@@ -266,7 +257,7 @@ mod tests {
             votes(30, "sub1", &[("alice", Vote::Abstain)]),
             &[("sub1", "rec1", LIVE_WITHIN_6)],
         );
-        let baseline = logistic_of(0.0);
+        let baseline = 0.0;
         assert_close(neuron_no.run_user("alice"), baseline);
         assert_close(neuron_abstain.run_user("alice"), baseline);
     }
@@ -291,7 +282,7 @@ mod tests {
             votes(30, "sub1", &[("bob", Vote::Yes)]),
             &[("sub1", "rec1", LIVE_WITHIN_6)],
         );
-        let baseline = logistic_of(0.0);
+        let baseline = 0.0;
         assert_close(neuron_missing_round.run_user("alice"), baseline);
         assert_close(neuron_missing_submission.run_user("alice"), baseline);
         assert_close(neuron_missing_user.run_user("alice"), baseline);
@@ -308,7 +299,7 @@ mod tests {
             HashMap::new(), // empty tranche_status_map
             submissions_airtable_ids,
         );
-        assert_close(neuron.run_user("alice"), logistic_of(0.0));
+        assert_close(neuron.run_user("alice"), 0.0);
     }
 
     #[test]
@@ -320,7 +311,7 @@ mod tests {
             HashMap::from([(LIVE_WITHIN_6.to_string(), vec!["rec1".to_string()])]),
             HashMap::new(), // sub1 has no airtable_id mapping
         );
-        assert_close(neuron.run_user("alice"), logistic_of(0.0));
+        assert_close(neuron.run_user("alice"), 0.0);
     }
 
     #[test]
@@ -341,7 +332,7 @@ mod tests {
             &[("sub1", "rec1", LIVE_WITHIN_6)],
         );
         let yes_bonus = logistic_of(0.30);
-        let baseline = logistic_of(0.0);
+        let baseline = 0.0;
         assert_close(neuron.run_user("alice"), yes_bonus);
         assert_close(neuron.run_user("bob"), yes_bonus);
         assert_close(neuron.run_user("carol"), baseline);
@@ -383,25 +374,57 @@ mod tests {
     }
 
     #[test]
-    fn empty_data_returns_logistic_of_zero() {
+    fn zero_bonus_produces_exactly_zero() {
+        // No contributions => raw bonus 0. The curve is centred on the origin, so an
+        // inactive voter scores exactly 0.0 — no positive baseline offset, no float noise.
         let neuron = build_neuron(HashMap::new(), HashMap::new(), &[]);
-        assert_close(neuron.run_user("alice"), logistic_of(0.0));
+        assert_eq!(neuron.run_user("alice"), 0.0);
     }
 
     #[test]
     fn logistic_parameters_pinned() {
-        // Locks in the (a=0, k=5, c=1, q=4, b=1, nu=1, x_off=1) configuration so
-        // accidental parameter changes are caught even if `logistic_of` is updated.
-        // Raw logistic(0) = 5 / (1 + 4 * exp(1)) ≈ 0.421119042004487; production
-        // subtracts that baseline so a voter with no contributions scores 0.
-        let neuron = build_neuron(HashMap::new(), HashMap::new(), &[]);
-        let result = neuron.run_user("alice");
-        assert!(result.abs() < 1e-12, "expected 0 for empty contributions, got {result}");
-        let raw_baseline = generalised_logistic_function(0.0, 5.0, 1.0, 4.0, 1.0, 1.0, 1.0, 0.0);
-        assert!(
-            (raw_baseline - 0.421_119_042_004_487).abs() < 1e-12,
-            "logistic baseline drifted: got {raw_baseline}"
-        );
+        // Locks in the (a=-5, k=5, c=1, q=1, b=0.4, nu=1, x_off=0) configuration.
+        // With these parameters the generalised logistic reduces exactly to the
+        // antisymmetric curve 5*tanh(0.2*raw). `tanh()` from std is an independent
+        // oracle, so any drift in run_user's parameters is caught even though
+        // `logistic_of` mirrors production. The neuron is driven through the real
+        // run_user path (one Yes vote => raw == the tranche bonus).
+        let scored = |status: &str| {
+            build_neuron(
+                votes(30, "sub1", &[("alice", Vote::Yes)]),
+                HashMap::new(),
+                &[("sub1", "rec1", status)],
+            )
+            .run_user("alice")
+        };
+        // +0.30 reward and -0.30 penalty pinned against the closed form.
+        assert_close(scored(LIVE_WITHIN_6), 5.0 * (0.2 * 0.30_f64).tanh());
+        assert_close(scored(NOT_LIVE_AWARDED), 5.0 * (0.2 * -0.30_f64).tanh());
+        // Empty contributions => raw 0 => exactly 0.0, no baseline offset.
+        let empty = build_neuron(HashMap::new(), HashMap::new(), &[]);
+        assert_eq!(empty.run_user("alice"), 0.0);
+    }
+
+    #[test]
+    fn positive_and_negative_bonuses_are_symmetric() {
+        // Equal magnitude, opposite sign: LIVE_WITHIN_6 = +0.30, NOT_LIVE_AWARDED = -0.30.
+        // A reward and an equal-sized penalty must be exact negatives of each other, so
+        // the neuron treats good and bad voting symmetrically.
+        let reward = build_neuron(
+            votes(30, "sub1", &[("alice", Vote::Yes)]),
+            HashMap::new(),
+            &[("sub1", "rec1", LIVE_WITHIN_6)],
+        )
+        .run_user("alice");
+        let penalty = build_neuron(
+            votes(30, "sub1", &[("alice", Vote::Yes)]),
+            HashMap::new(),
+            &[("sub1", "rec1", NOT_LIVE_AWARDED)],
+        )
+        .run_user("alice");
+        assert!(reward > 0.0, "reward should be positive, got {reward}");
+        assert!(penalty < 0.0, "penalty should be negative, got {penalty}");
+        assert_close(penalty, -reward);
     }
 
     #[test]
@@ -429,13 +452,15 @@ mod tests {
         let huge = mk(500, LIVE_WITHIN_6); // raw is large enough that f64 saturates at 5.0
         assert!(one < many, "one={one} many={many}");
         assert!(many <= huge, "many={many} huge={huge}");
-        // Bounded above by k=5 minus the baseline subtraction (~0.421).
+        // Bounded above by the upper asymptote k=5.
         assert!(huge <= 5.0, "huge={huge}");
-        assert!(many > 4.0, "many={many}"); // logistic_of(15) is already very close to k=5
-                                            // Penalties mirror the positive side: bounded below by ~-(k - baseline).
+        assert!(many > 4.0, "many={many}"); // 5*tanh(0.2*15) is already very close to k=5
+                                            // Penalties mirror the positive side: bounded below by the lower asymptote -k=-5.
         let very_negative = mk(50, NOT_LIVE_AWARDED); // raw = 50 * -0.30 = -15
         assert!(very_negative >= -5.0, "very_negative={very_negative}");
         assert!(very_negative < -4.0, "very_negative={very_negative}");
+        // Equal-magnitude reward and penalty are exact negatives of each other.
+        assert_close(very_negative, -many);
     }
 
     #[test]
@@ -448,7 +473,7 @@ mod tests {
         let users = vec!["alice".to_string(), "bob".to_string(), "carol".to_string()];
         let result = neuron.calculate_result(&users);
         assert_eq!(result.len(), 3);
-        let baseline = logistic_of(0.0);
+        let baseline = 0.0;
         assert_close(*result.get("alice").unwrap(), logistic_of(0.30));
         assert_close(*result.get("bob").unwrap(), baseline);
         assert_close(*result.get("carol").unwrap(), baseline);
